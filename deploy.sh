@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+echo "Building safe-task-claim..."
+cargo install --path .
+echo "Done. Restart Claude Code to reload the MCP server."
