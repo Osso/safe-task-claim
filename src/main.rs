@@ -111,10 +111,10 @@ impl SafeTaskClaim {
         task_id: &str,
         owner: &str,
     ) -> anyhow::Result<String> {
-        let content = fs::read_to_string(task_path)
-            .with_context(|| format!("cannot read task {task_id}"))?;
-        let mut task: TaskFile =
-            serde_json::from_str(&content).with_context(|| format!("invalid JSON in task {task_id}"))?;
+        let content =
+            fs::read_to_string(task_path).with_context(|| format!("cannot read task {task_id}"))?;
+        let mut task: TaskFile = serde_json::from_str(&content)
+            .with_context(|| format!("invalid JSON in task {task_id}"))?;
 
         if let Some(existing) = &task.owner {
             if !existing.is_empty() {
@@ -133,27 +133,24 @@ impl SafeTaskClaim {
         task.status = "in_progress".to_string();
 
         let json = serde_json::to_string_pretty(&task)?;
-        fs::write(task_path, json)
-            .with_context(|| format!("cannot write task {task_id}"))?;
+        fs::write(task_path, json).with_context(|| format!("cannot write task {task_id}"))?;
 
         Ok(format!("Claimed task {task_id}: {}", task.subject))
     }
 }
 
 fn lock_exclusive(file: &fs::File) -> anyhow::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
-    if ret != 0 {
-        bail!("flock failed: {}", io::Error::last_os_error());
-    }
-    Ok(())
+    flock_with_operation(file, libc::LOCK_EX)
 }
 
 fn unlock(file: &fs::File) -> anyhow::Result<()> {
+    flock_with_operation(file, libc::LOCK_UN)
+}
+
+fn flock_with_operation(file: &fs::File, operation: i32) -> anyhow::Result<()> {
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
-    let ret = unsafe { libc::flock(fd, libc::LOCK_UN) };
+    let ret = unsafe { libc::flock(fd, operation) };
     if ret != 0 {
         bail!("flock failed: {}", io::Error::last_os_error());
     }
@@ -162,7 +159,9 @@ fn unlock(file: &fs::File) -> anyhow::Result<()> {
 
 #[tool_router]
 impl SafeTaskClaim {
-    #[tool(description = "Atomically claim a task with file locking. Rejects if already claimed, in_progress, or completed.")]
+    #[tool(
+        description = "Atomically claim a task with file locking. Rejects if already claimed, in_progress, or completed."
+    )]
     async fn safe_claim(&self, Parameters(params): Parameters<SafeClaimParams>) -> String {
         match self.do_claim(params) {
             Ok(msg) => msg,
@@ -223,11 +222,7 @@ mod tests {
         setup_team(&team_dir, "1", "pending", None);
 
         let service = SafeTaskClaim::new();
-        let result = service.claim_under_lock(
-            &team_dir.join("1.json"),
-            "1",
-            "agent-a",
-        );
+        let result = service.claim_under_lock(&team_dir.join("1.json"), "1", "agent-a");
         assert!(result.is_ok());
         assert!(result.unwrap().contains("Claimed task 1"));
 
@@ -244,13 +239,14 @@ mod tests {
         setup_team(&team_dir, "2", "pending", Some("agent-b"));
 
         let service = SafeTaskClaim::new();
-        let result = service.claim_under_lock(
-            &team_dir.join("2.json"),
-            "2",
-            "agent-a",
-        );
+        let result = service.claim_under_lock(&team_dir.join("2.json"), "2", "agent-a");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already claimed by agent-b"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already claimed by agent-b")
+        );
     }
 
     #[test]
@@ -260,13 +256,14 @@ mod tests {
         setup_team(&team_dir, "3", "in_progress", None);
 
         let service = SafeTaskClaim::new();
-        let result = service.claim_under_lock(
-            &team_dir.join("3.json"),
-            "3",
-            "agent-a",
-        );
+        let result = service.claim_under_lock(&team_dir.join("3.json"), "3", "agent-a");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already in_progress"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already in_progress")
+        );
     }
 
     #[test]
@@ -276,12 +273,13 @@ mod tests {
         setup_team(&team_dir, "4", "completed", None);
 
         let service = SafeTaskClaim::new();
-        let result = service.claim_under_lock(
-            &team_dir.join("4.json"),
-            "4",
-            "agent-a",
-        );
+        let result = service.claim_under_lock(&team_dir.join("4.json"), "4", "agent-a");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already completed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already completed")
+        );
     }
 }
