@@ -45,28 +45,37 @@ struct SafeClaimParams {
 #[derive(Clone)]
 struct SafeTaskClaim {
     tool_router: ToolRouter<Self>,
+    tasks_dir: PathBuf,
 }
 
 impl SafeTaskClaim {
     fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            tasks_dir: Self::default_tasks_dir(),
         }
     }
 
-    fn tasks_dir() -> PathBuf {
+    fn default_tasks_dir() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".claude/tasks")
     }
 
-    fn resolve_team(team: Option<&str>) -> anyhow::Result<String> {
+    #[cfg(test)]
+    fn with_tasks_dir(tasks_dir: PathBuf) -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+            tasks_dir,
+        }
+    }
+
+    fn resolve_team(&self, team: Option<&str>) -> anyhow::Result<String> {
         if let Some(t) = team {
             return Ok(t.to_string());
         }
-        let tasks_dir = Self::tasks_dir();
-        let entries = fs::read_dir(&tasks_dir)
-            .with_context(|| format!("cannot read {}", tasks_dir.display()))?;
+        let entries = fs::read_dir(&self.tasks_dir)
+            .with_context(|| format!("cannot read {}", self.tasks_dir.display()))?;
         for entry in entries {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
@@ -75,12 +84,12 @@ impl SafeTaskClaim {
                 }
             }
         }
-        bail!("no team directories found in {}", tasks_dir.display());
+        bail!("no team directories found in {}", self.tasks_dir.display());
     }
 
     fn do_claim(&self, params: SafeClaimParams) -> anyhow::Result<String> {
-        let team = Self::resolve_team(params.team.as_deref())?;
-        let team_dir = Self::tasks_dir().join(&team);
+        let team = self.resolve_team(params.team.as_deref())?;
+        let team_dir = self.tasks_dir.join(&team);
         if !team_dir.is_dir() {
             bail!("team directory not found: {}", team_dir.display());
         }
@@ -215,6 +224,18 @@ mod tests {
         fs::write(dir.join(format!("{task_id}.json")), json).unwrap();
     }
 
+    fn service_for(tmp: &tempfile::TempDir) -> SafeTaskClaim {
+        SafeTaskClaim::with_tasks_dir(tmp.path().join("tasks"))
+    }
+
+    fn claim_params(task_id: &str, owner: &str, team: Option<&str>) -> SafeClaimParams {
+        SafeClaimParams {
+            task_id: task_id.to_string(),
+            owner: owner.to_string(),
+            team: team.map(str::to_string),
+        }
+    }
+
     #[test]
     fn claim_pending_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
@@ -281,5 +302,207 @@ mod tests {
                 .to_string()
                 .contains("already completed")
         );
+    }
+
+    #[test]
+    fn claim_deleted_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_dir = tmp.path().join("test-team");
+        setup_team(&team_dir, "5", "deleted", None);
+
+        let service = SafeTaskClaim::new();
+        let result = service.claim_under_lock(&team_dir.join("5.json"), "5", "agent-a");
+
+        assert!(result.unwrap_err().to_string().contains("task is deleted"));
+    }
+
+    #[test]
+    fn claim_empty_owner_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_dir = tmp.path().join("test-team");
+        setup_team(&team_dir, "6", "pending", Some(""));
+
+        let service = SafeTaskClaim::new();
+        let result = service.claim_under_lock(&team_dir.join("6.json"), "6", "agent-a");
+
+        assert!(result.unwrap().contains("Claimed task 6"));
+    }
+
+    #[test]
+    fn claim_invalid_json_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_dir = tmp.path().join("test-team");
+        fs::create_dir_all(&team_dir).unwrap();
+        fs::write(team_dir.join("7.json"), "{bad json").unwrap();
+
+        let service = SafeTaskClaim::new();
+        let result = service.claim_under_lock(&team_dir.join("7.json"), "7", "agent-a");
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid JSON in task 7")
+        );
+    }
+
+    #[test]
+    fn resolve_team_returns_explicit_team() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+
+        assert_eq!(service.resolve_team(Some("chosen")).unwrap(), "chosen");
+    }
+
+    #[test]
+    fn resolve_team_defaults_to_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+        fs::create_dir_all(service.tasks_dir.join("alpha")).unwrap();
+        fs::write(service.tasks_dir.join("note.txt"), "ignore files").unwrap();
+
+        assert_eq!(service.resolve_team(None).unwrap(), "alpha");
+    }
+
+    #[test]
+    fn resolve_team_without_task_root_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+
+        assert!(
+            service
+                .resolve_team(None)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot read")
+        );
+    }
+
+    #[test]
+    fn resolve_team_without_directories_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+        fs::create_dir_all(&service.tasks_dir).unwrap();
+        fs::write(service.tasks_dir.join("note.txt"), "ignore files").unwrap();
+
+        assert!(
+            service
+                .resolve_team(None)
+                .unwrap_err()
+                .to_string()
+                .contains("no team directories found")
+        );
+    }
+
+    #[test]
+    fn do_claim_explicit_team_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+        let team_dir = service.tasks_dir.join("team-a");
+        setup_team(&team_dir, "8", "pending", None);
+
+        let result = service
+            .do_claim(claim_params("8", "agent-a", Some("team-a")))
+            .unwrap();
+
+        assert!(result.contains("Claimed task 8"));
+        assert!(team_dir.join(".lock").exists());
+    }
+
+    #[test]
+    fn do_claim_default_team_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+        let team_dir = service.tasks_dir.join("team-a");
+        setup_team(&team_dir, "9", "pending", None);
+
+        let result = service
+            .do_claim(claim_params("9", "agent-a", None))
+            .unwrap();
+
+        assert!(result.contains("Claimed task 9"));
+    }
+
+    #[test]
+    fn do_claim_missing_team_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+        fs::create_dir_all(&service.tasks_dir).unwrap();
+
+        let result = service.do_claim(claim_params("10", "agent-a", Some("missing")));
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("team directory not found")
+        );
+    }
+
+    #[test]
+    fn do_claim_missing_task_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+        fs::create_dir_all(service.tasks_dir.join("team-a")).unwrap();
+
+        let result = service.do_claim(claim_params("11", "agent-a", Some("team-a")));
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("task file not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn safe_claim_formats_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+        setup_team(&service.tasks_dir.join("team-a"), "12", "pending", None);
+
+        let message = service
+            .safe_claim(Parameters(claim_params("12", "agent-a", Some("team-a"))))
+            .await;
+
+        assert!(message.contains("Claimed task 12"));
+    }
+
+    #[tokio::test]
+    async fn safe_claim_formats_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = service_for(&tmp);
+
+        let message = service
+            .safe_claim(Parameters(claim_params("13", "agent-a", Some("missing"))))
+            .await;
+
+        assert!(message.starts_with("Error: team directory not found"));
+    }
+
+    #[test]
+    fn server_info_describes_tool_usage() {
+        let service = SafeTaskClaim::new();
+        let info = service.get_info();
+
+        assert!(
+            info.instructions
+                .unwrap()
+                .contains("Use safe_claim before starting work")
+        );
+    }
+
+    #[test]
+    fn lock_and_unlock_succeed_for_open_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join(".lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+
+        lock_exclusive(&file).unwrap();
+        unlock(&file).unwrap();
     }
 }
